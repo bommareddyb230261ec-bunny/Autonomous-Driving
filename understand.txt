@@ -1,0 +1,259 @@
+OpenEMMA project overview
+========================
+
+This repository is an end-to-end autonomous driving research project that combines:
+- a Vision-Language Model (VLM) for scene understanding and intent prediction,
+- a 3D object detector (YOLO3D) for critical object detection,
+- trajectory prediction and visualization using nuScenes driving data.
+
+The core idea is:
+1. Load a front-camera driving image sequence from nuScenes.
+2. Detect important road objects using YOLO3D.
+3. Ask a VLM to describe the scene, critical objects, and driving intent.
+4. Convert the visual scene + historical ego motion into predicted future speeds/curvatures.
+5. Reconstruct the future ego trajectory and save annotated images/video results.
+
+Top-level files and folders
+---------------------------
+
+README.md
+- Main project documentation.
+- Explains the purpose of OpenEMMA, installation steps, model choices, and how to run the pipeline.
+- Tells you what the project is trying to do before you read the code.
+
+requirements.txt
+- Lists all Python packages required by the project.
+- This is the dependency list for installing the environment.
+- Includes PyTorch, vision libraries, transformers, ultralytics, nuscenes-devkit, pyquaternion, etc.
+
+main.py
+- This is the main execution script for the OpenEMMA pipeline.
+- It loads the chosen model (Qwen or LLaVA), reads the nuScenes dataset, extracts front-camera sequences and ego poses, and iterates through scenes.
+- It computes historical ego velocities and curvatures, calls the VLM to generate scene/object/intent descriptions, predicts future motion, overlays trajectory on images, and saves metrics and outputs.
+- This is the most important file in the project because it connects the dataset, detector, VLM, and trajectory logic into one workflow.
+
+utils.py
+- A general-purpose support file for geometry, projection, plotting, and trajectory math.
+- Includes functions such as:
+  - query_gpt4(): OpenAI/GPT style API call helper
+  - encode_image(): convert image to base64 for multimodal API prompts
+  - TransformPoint(), FormTransformationMatrix(), ProjectWorldToImage(): 3D-to-2D camera geometry logic
+  - OffsetTrajectory3D(), OverlayTrajectory(): drawing predicted trajectory on top of images
+  - EstimateCurvatureFromTrajectory(): compute curvature from a path
+  - IntegrateCurvatureForPoints(): reconstruct future motion from speed and curvature
+  - WriteImageSequenceToVideo(): save a sequence of images into a MP4 video
+- This file is not the driver script, but it contains the core geometric and visualization utilities required by the main pipeline.
+
+extract_nuscenes.py
+- Dataset preparation helper.
+- Download and extract the nuScenes mini dataset archive from Azure ML storage to a local folder.
+- It checks whether the archive already exists; if not, it downloads it and unpacks it.
+- This file exists so the dataset can be prepared before running the training/inference pipeline.
+
+llava/
+- A custom or embedded LLaVA codebase used for multimodal inference.
+- This is the local model runtime used to process image + text prompts with the LLaVA family of VLMs.
+- It provides utilities to:
+  - initialize model weights,
+  - tokenize image/text prompts,
+  - process images for the model,
+  - build conversational templates.
+- Why it matters: the project can use LLaVA-based models as an alternative VLM backbone.
+
+llava/__init__.py
+- Package marker for the llava module.
+- Makes the folder a Python package.
+
+llava/constants.py
+- Defines constants used in multimodal prompting for LLaVA.
+- Includes image token placeholders and prompt formatting tokens.
+- Needed so the model knows where image tokens appear in the text prompt.
+
+llava/conversation.py
+- Stores chat prompt templates and conversation roles.
+- This is used to build the textual input format expected by LLaVA models.
+
+llava/mm_utils.py
+- Multimodal utility functions for image preprocessing and tokenization.
+- This is where image inputs are converted into a format that the model can consume.
+
+llava/mm_utils_differentiable.py
+- A differentiable or variant form of multimodal utilities.
+- Likely used in more advanced or experimental versions of the LLaVA pipeline.
+
+llava/utils.py
+- General helper utilities for the LLaVA integration.
+- Includes disabling default torch initialization and other model-loading related utilities.
+
+llava/model/
+- Model implementation package for LLaVA architecture.
+- This is the core model-building code for loading pretrained LLaVA models.
+
+llava/model/__init__.py
+- Package marker for the model subpackage.
+
+llava/model/builder.py
+- Builds/loading the LLaVA model from configuration and checkpoint.
+- This file is critical for instantiating the actual model object.
+
+llava/model/llava_arch.py
+- The main LLaVA model architecture definition.
+- Defines how the vision encoder and language model are integrated.
+
+llava/model/utils.py
+- Shared utilities used inside the LLaVA model package.
+
+llava/model/language_model/
+- Contains language model backbones used by LLaVA such as:
+  - llava_llama.py
+  - llava_mistral.py
+  - llava_mpt.py
+- These define how the language model component is connected to the multimodal system.
+
+llava/model/multimodal_encoder/
+- Contains the vision encoder code used to extract image features.
+- Example: builder.py, clip_encoder.py
+- This is where image input is transformed into embeddings for the LLM.
+
+llava/model/multimodal_projector/
+- Connects image features from the encoder to the language model embedding space.
+- This is the bridge between visual and language representations.
+
+llava/serve/
+- Serving/inference web and worker code for LLaVA.
+- Used for model serving, local APIs, workers, or Gradio-related interfaces.
+- Example files:
+  - cli.py: command-line interface
+  - controller.py: request controller for worker orchestration
+  - gradio_web_server.py: Gradio UI server
+  - model_worker.py: worker that loads and serves the VLM
+  - register_worker.py: worker registration logic
+  - sglang_worker.py: variant worker for SGLang backend
+  - test_message.py: quick message test / smoke test
+
+llava/train/
+- Training scripts for LLaVA-based models.
+- Files include monkey-patches and trainer utilities for flash attention and xformers.
+- Example:
+  - llava_trainer.py: custom trainer
+  - train.py, train_mem.py, train_xformers.py: training entry points
+  - llama_flash_attn_monkey_patch.py and llama_xformers_attn_monkey_patch.py: patching attention kernels for different training setups
+
+openemma/
+- Main package folder for the autonomous driving logic built on top of the VLM + detector pipeline.
+- This is the domain-specific code for the project’s driving application.
+
+openemma/YOLO3D/
+- The 3D object detection submodule.
+- It is a YOLO-based 3D detector for detecting objects in driving scenes and predicting 3D boxes from images.
+- This module is used in the main pipeline to identify important road users before prompting the VLM.
+
+openemma/YOLO3D/README.md
+- Documentation specific to the YOLO3D detector.
+- Explains the setup and usage of the 3D detector component.
+
+openemma/YOLO3D/inference.py
+- The main object-detection inference file for YOLO3D.
+- It loads the YOLO detector and a regressor network, runs 2D and 3D detection on images, and produces 3D object outputs.
+- This file is important because the main script uses yolo3d_nuScenes() to detect critical objects before planning the trajectory.
+
+openemma/YOLO3D/main.py
+- Generic entry point for the YOLO3D project itself.
+- Different from the repository root main.py; this is the detector module's own runner script.
+
+openemma/YOLO3D/runDocker.sh
+- Docker startup helper for the detector environment.
+- Useful for running the project in a containerized setup.
+
+openemma/YOLO3D/requirements.txt
+- Dependency list for the YOLO3D component.
+
+openemma/YOLO3D/requirements_emma.txt
+- Additional package list for the OpenEMMA-specific detector environment.
+
+openemma/YOLO3D/yolo11n_nuimages.pt
+- Pretrained YOLO model weights used for 2D detection.
+- It helps detect objects before their 3D attributes are estimated.
+
+openemma/YOLO3D/weights/get_weights.py
+- Downloads pretrained model weights for the detector.
+- This is necessary to compensate for not storing all large files in the repo.
+
+openemma/YOLO3D/library/
+- Geometry and plotting helpers for the 3D detection code.
+- Files include:
+  - Calib.py: calibration logic for camera parameters
+  - Math.py: math functions for geometry and coordinate transformations
+  - Plotting.py: helper functions for drawing boxes and visualizations
+
+openemma/YOLO3D/script/
+- Core detector training and model logic.
+- Files include:
+  - ClassAverages.py: class size statistics used to estimate object dimensions
+  - Dataset.py: dataset loading and object parsing
+  - Dataset_lightning.py: PyTorch Lightning dataset wrapper
+  - Model.py: main network architecture definitions
+  - Model_lightning.py: Lightning training version
+  - readme.md: notes for this script folder
+
+openemma/YOLO3D/utils/
+- Utility functions for the detector and training pipeline.
+- Includes:
+  - activations.py: custom activation functions
+  - augmentations.py: image augmentations for training
+  - autoanchor.py: anchor generation for YOLO-like detection
+  - autobatch.py: automatic batch-size tuning
+  - callbacks.py: training callbacks
+  - datasets.py: dataset utilities
+  - downloads.py: model/data download helpers
+  - general.py: general helper functions
+  - loss.py: detection loss implementations
+  - metrics.py: evaluation metrics
+  - plots.py: plotting support
+  - torch_utils.py: PyTorch utilities
+  - aws/: helper scripts for AWS deployment/resume utilities
+  - flask_rest_api/: Flask REST API example for the detector
+  - google_app_engine/: GAE deployment support
+  - loggers/: W&B logging integrations
+
+openemma/YOLO3D/test/
+- Test scripts for verifying detector behavior.
+- Example: test_yolo11.py
+
+Why these pieces fit together
+-----------------------------
+
+This project is not just one model; it is a pipeline made of several components:
+- nuScenes dataset provides driving scenes and ego-motion data.
+- YOLO3D detects important objects in the front camera image.
+- LLaVA/Qwen interprets the image and text prompts to reason about the driving scene.
+- The main script combines those descriptions with vehicle history to predict future motion.
+- The utilities convert vehicle motion into image-space overlays and save results as video and plots.
+
+This is why the repository has both a general root-level orchestration layer and a lower-level detector/model layer. The root files control the project workflow, while the subfolders contain the actual machine-learning and supporting code.
+
+In one sentence:
+- main.py = project orchestrator
+- utils.py = geometry and plotting support
+- llava/ = multimodal model runtime
+- openemma/YOLO3D/ = 3D object detector and perception module
+- extract_nuscenes.py = dataset download/extraction helper
+
+How to think about the project when reading it
+----------------------------------------------
+
+If you are learning the repo, read in this order:
+1. README.md
+2. requirements.txt
+3. main.py
+4. utils.py
+5. openemma/YOLO3D/inference.py
+6. llava/ model loading files
+7. rest of the detector and training utilities only if needed
+
+This order matches the flow of the system: install dependencies -> run pipeline -> understand geometry -> inspect perception model -> inspect VLM integration.
+
+
+Running Command=
+.\.venv\Scripts\Activate.ps1
+python main.py --dataroot v1.0-mini --version v1.0-mini --method openemma
