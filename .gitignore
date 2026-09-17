@@ -1,7 +1,19 @@
 .env
 .venv/
 __pycache__/
+**pycache**/
+**__pycache__/
+**/__pycache__/
 *.py[cod]
+*.pyc
+*.pt
+*.pth
+*.ckpt
+*.zip
+checkpoints/
+diffusion_outputs/
+outputs/
+.kaggle/
 
 # Local dataset and generated predictions
 v1.0-mini/

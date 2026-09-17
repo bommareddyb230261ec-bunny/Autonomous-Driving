@@ -1,13 +1,14 @@
-torch==2.14.0
-torchvision==0.29.0
-ultralytics==8.4.150
-google-genai==2.23.0
-python-dotenv==1.2.3
-nuscenes-devkit==1.2.0
-pyquaternion==0.9.9
-opencv-python==4.11.0.86
-matplotlib==3.11.2
-numpy==1.26.4
-Pillow==12.3.0
-scipy==1.17.1
-requests==2.34.2
+# Do not pin torch/torchvision here. Kaggle notebooks normally provide a
+# CUDA-compatible PyTorch build; replacing it can break GPU training.
+diffusers>=0.30.0
+numpy>=1.26,<3
+nuscenes-devkit>=1.2.0
+matplotlib>=3.8
+pyquaternion>=0.9.9
+opencv-python>=4.10
+Pillow>=10
+scipy>=1.11
+requests>=2.31
+python-dotenv>=1.0
+google-genai>=1.0
+ultralytics>=8.3
