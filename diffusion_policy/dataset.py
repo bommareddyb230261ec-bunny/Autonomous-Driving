@@ -30,6 +30,19 @@ class _Window:
     semantic_metadata: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class _ConditioningWindow:
+    scene_token: str
+    scene_name: str
+    sample_token: str
+    current_image: str
+    current_position: np.ndarray
+    current_velocity: np.ndarray
+    current_curvature: float
+    history_speed: np.ndarray
+    history_curvature: np.ndarray
+
+
 def _load_semantic_cache(cache_path: Path | None) -> dict[str, Mapping[str, Any]]:
     if cache_path is None:
         return {}
@@ -55,6 +68,39 @@ def _metadata_for_sample(
 
 def _record_skip(skipped: dict[str, int], reason: str) -> None:
     skipped[reason] = skipped.get(reason, 0) + 1
+
+
+def describe_nuscenes_structure(dataroot: str | Path, max_entries: int = 80) -> list[str]:
+    """Return a shallow directory listing useful for Kaggle path diagnostics."""
+    root = Path(dataroot)
+    if not root.exists():
+        return [f"{root} does not exist"]
+    entries = []
+    for path in sorted(root.rglob("*")):
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            relative = path
+        entries.append(f"{relative}{'/' if path.is_dir() else ''}")
+        if len(entries) >= max_entries:
+            entries.append("...")
+            break
+    return entries
+
+
+def validate_nuscenes_dataroot(dataroot: str | Path, version: str) -> None:
+    """Validate the expected nuScenes directory layout before expensive loading."""
+    root = Path(dataroot)
+    required = ("samples", "sweeps", "maps", version)
+    missing = [name for name in required if not (root / name).exists()]
+    if not missing:
+        return
+    structure = "\n".join(f"  {entry}" for entry in describe_nuscenes_structure(root))
+    raise FileNotFoundError(
+        f"nuScenes dataroot is missing required entries for {version}: {missing}\n"
+        f"Received dataroot: {root}\n"
+        f"Detected structure:\n{structure}"
+    )
 
 
 def _scene_records(nusc: NuScenes, scene: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -116,11 +162,57 @@ class NuScenesDiffusionDataset(Dataset):
         }
 
 
+class NuScenesConditioningDataset(Dataset):
+    """nuScenes windows with conditioning only, for annotation-free test inference."""
+
+    def __init__(
+        self,
+        windows: list[_ConditioningWindow],
+        skipped_reasons: Mapping[str, int] | None = None,
+    ) -> None:
+        self._windows = windows
+        self.skipped_reasons = dict(skipped_reasons or {})
+
+    def __len__(self) -> int:
+        return len(self._windows)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        window = self._windows[index]
+        return {
+            "history_speed": torch.from_numpy(window.history_speed.copy()).float(),
+            "history_curvature": torch.from_numpy(window.history_curvature.copy()).float(),
+            "ego_state": torch.from_numpy(
+                np.concatenate(
+                    (
+                        window.current_position,
+                        window.current_velocity,
+                        np.asarray([window.current_curvature], dtype=float),
+                    )
+                )
+            ).float(),
+            "current_position": torch.from_numpy(window.current_position.copy()).float(),
+            "current_velocity": torch.from_numpy(window.current_velocity.copy()).float(),
+            "current_curvature": torch.tensor(window.current_curvature).float(),
+            "current_image": window.current_image,
+            "sample_token": window.sample_token,
+            "scene_token": window.scene_token,
+            "scene_name": window.scene_name,
+        }
+
+
 def collate_diffusion_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     """Stack numerical fields while preserving variable-length raw metadata."""
     if not samples:
         raise ValueError("cannot collate an empty batch")
-    tensor_keys = {"history_speed", "history_curvature", "ego_state", "target_actions"}
+    tensor_keys = {
+        "history_speed",
+        "history_curvature",
+        "ego_state",
+        "target_actions",
+        "current_position",
+        "current_velocity",
+        "current_curvature",
+    }
     return {
         key: torch.stack([sample[key] for sample in samples])
         if key in tensor_keys
@@ -230,3 +322,75 @@ def build_train_val_datasets(
         train_scene_tokens,
         val_scene_tokens,
     )
+
+
+def build_test_conditioning_dataset(
+    config: DatasetConfig,
+) -> tuple[NuScenesConditioningDataset, set[str]]:
+    """Build annotation-free conditioning windows for official nuScenes test data."""
+    if config.obs_len <= 0:
+        raise ValueError("obs_len must be positive")
+
+    nusc = NuScenes(version=config.version, dataroot=str(config.dataroot), verbose=False)
+    scenes = list(nusc.scene)
+    scene_tokens = {scene["token"] for scene in scenes}
+    windows: list[_ConditioningWindow] = []
+    skipped: dict[str, int] = {}
+    total_scene_samples = 0
+
+    for scene in scenes:
+        records = _scene_records(nusc, scene)
+        total_scene_samples += len(records)
+        positions = np.asarray([record["position"] for record in records], dtype=float)
+        if len(records) < config.obs_len:
+            _record_skip(skipped, "scene_too_short_for_history")
+            continue
+        if not np.isfinite(positions).all():
+            _record_skip(skipped, "non_finite_scene_pose")
+            continue
+
+        velocities = np.zeros_like(positions)
+        velocities[1:] = np.diff(positions, axis=0) / config.dt
+        velocities[0] = velocities[1]
+        try:
+            curvatures = EstimateCurvatureFromTrajectory(positions)
+        except (IndexError, ValueError, FloatingPointError):
+            _record_skip(skipped, "curvature_estimation_failure")
+            continue
+        speeds = np.linalg.norm(velocities, axis=1)
+
+        for start in range(len(records) - config.obs_len + 1):
+            current_index = start + config.obs_len - 1
+            try:
+                record = records[current_index]
+                if not Path(record["image_path"]).is_file():
+                    raise ValueError("current_image_missing")
+                history_speed = speeds[start : start + config.obs_len]
+                history_curvature = curvatures[start : start + config.obs_len]
+                current_velocity = velocities[current_index]
+                current_curvature = curvatures[current_index]
+                arrays = (history_speed, history_curvature, current_velocity)
+                if not all(np.isfinite(array).all() for array in arrays):
+                    raise ValueError("sample contains NaN or Inf values")
+            except ValueError as exc:
+                _record_skip(skipped, str(exc))
+                continue
+            windows.append(
+                _ConditioningWindow(
+                    scene_token=scene["token"],
+                    scene_name=scene["name"],
+                    sample_token=record["sample_token"],
+                    current_image=record["image_path"],
+                    current_position=positions[current_index],
+                    current_velocity=current_velocity,
+                    current_curvature=float(current_curvature),
+                    history_speed=history_speed,
+                    history_curvature=history_curvature,
+                )
+            )
+
+    print(f"Number of test scenes: {len(scenes)}")
+    print(f"Number of test scene samples: {total_scene_samples}")
+    print(f"Number of valid test windows: {len(windows)}")
+    print(f"Skipped test samples/scenes by reason: {skipped or 'none'}")
+    return NuScenesConditioningDataset(windows, skipped), scene_tokens

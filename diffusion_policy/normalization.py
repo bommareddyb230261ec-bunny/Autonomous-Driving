@@ -169,6 +169,29 @@ class DiffusionNormalizer:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
+    @classmethod
+    def load(cls, path: str | Path) -> "DiffusionNormalizer":
+        input_path = Path(path)
+        payload = json.loads(input_path.read_text(encoding="utf-8"))
+        if payload.get("version") != _JSON_VERSION:
+            raise ValueError(f"unsupported normalization stats version in {input_path}")
+        statistics = payload.get("statistics")
+        if not isinstance(statistics, Mapping):
+            raise ValueError(f"normalization stats file is missing statistics: {input_path}")
+        normalizer = cls()
+        for field in NUMERICAL_FIELDS:
+            if field not in statistics:
+                raise ValueError(f"normalization stats file is missing field: {field}")
+            field_stats = statistics[field]
+            mean = np.asarray(field_stats["mean"], dtype=np.float64)
+            std = np.asarray(field_stats["std"], dtype=np.float64)
+            safe_std = np.asarray(field_stats.get("safe_std", np.maximum(std, 1e-8)), dtype=np.float64)
+            protected = [int(index) for index in field_stats.get("protected_dimensions", [])]
+            normalizer._stats[field] = {"mean": mean, "std": std}
+            normalizer._safe_std[field] = safe_std
+            normalizer._protected_dimensions[field] = protected
+        return normalizer
+
 
 class NormalizedDiffusionDataset(Dataset):
     """Explicit normalized view over a raw diffusion-policy Dataset."""

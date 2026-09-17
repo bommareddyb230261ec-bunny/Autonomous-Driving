@@ -17,7 +17,11 @@ from torch.utils.data import DataLoader, Subset
 
 from diffusion_policy.conditioning import DrivingConditionEncoder
 from diffusion_policy.config import ACTION_DIM, CONDITION_DIM, DatasetConfig, FUT_LEN
-from diffusion_policy.dataset import build_train_val_datasets, collate_diffusion_batch
+from diffusion_policy.dataset import (
+    build_train_val_datasets,
+    collate_diffusion_batch,
+    validate_nuscenes_dataroot,
+)
 from diffusion_policy.model import DrivingDiffusionPolicy
 from diffusion_policy.normalization import DiffusionNormalizer, NormalizedDiffusionDataset
 from diffusion_policy.scheduler import DrivingDiffusionScheduler
@@ -25,8 +29,12 @@ from diffusion_policy.scheduler import DrivingDiffusionScheduler
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train OpenEMMA diffusion policy on Kaggle.")
-    parser.add_argument("--dataroot", required=True, type=Path)
-    parser.add_argument("--version", default="v1.0-mini")
+    parser.add_argument("--train-dataroot", type=Path)
+    parser.add_argument("--train-version", default="v1.0-trainval")
+    parser.add_argument("--test-dataroot", default=None, type=Path)
+    parser.add_argument("--test-version", default="v1.0-test")
+    parser.add_argument("--dataroot", default=None, type=Path, help="Backward-compatible alias for --train-dataroot")
+    parser.add_argument("--version", default=None, help="Backward-compatible alias for --train-version")
     parser.add_argument("--output-dir", default=Path("/kaggle/working/diffusion_outputs"), type=Path)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--batch-size", default=4, type=int)
@@ -276,6 +284,8 @@ def checkpoint_payload(
     optimizer: torch.optim.Optimizer,
     best_val_loss: float,
     config: dict[str, Any],
+    scheduler: DrivingDiffusionScheduler,
+    normalizer: DiffusionNormalizer,
 ) -> dict[str, Any]:
     return {
         "epoch": epoch,
@@ -284,21 +294,94 @@ def checkpoint_payload(
         "optimizer_state_dict": optimizer.state_dict(),
         "best_val_loss": best_val_loss,
         "config": config,
+        "scheduler_config": {
+            "num_train_timesteps": scheduler.num_train_timesteps,
+            "beta_schedule": scheduler.beta_schedule,
+            "prediction_type": scheduler.prediction_type,
+        },
+        "normalizer_statistics": normalizer.statistics(),
         "normalization_stats_path": str(Path(config["output_dir"]) / "normalization_stats.json"),
     }
 
 
+def run_sanity_test(
+    train_loader: DataLoader,
+    condition_encoder: DrivingConditionEncoder,
+    diffusion_policy: DrivingDiffusionPolicy,
+    scheduler: DrivingDiffusionScheduler,
+    optimizer: torch.optim.Optimizer,
+    scaler: Any,
+    device: torch.device,
+) -> None:
+    condition_encoder.train()
+    diffusion_policy.train()
+    raw_batch = next(iter(train_loader))
+    batch = move_batch(raw_batch, device)
+    optimizer.zero_grad(set_to_none=True)
+    with amp_context(device):
+        clean_actions = batch["target_actions"]
+        noise = torch.randn_like(clean_actions)
+        timesteps = torch.randint(
+            0,
+            scheduler.num_train_timesteps,
+            (clean_actions.shape[0],),
+            device=device,
+        )
+        condition = condition_encoder(
+            history_speed=batch["history_speed"],
+            history_curvature=batch["history_curvature"],
+            ego_state=batch["ego_state"],
+        )
+        noisy_actions = scheduler.add_noise(clean_actions, noise, timesteps)
+        predicted_noise = diffusion_policy(noisy_actions, timesteps, condition)
+        loss = F.mse_loss(predicted_noise, noise)
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+    else:
+        loss.backward()
+    check_gradients([condition_encoder, diffusion_policy], 0, 0)
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    assert_finite_tensor("condition", condition, 0, 0)
+    assert_finite_tensor("target_actions", clean_actions, 0, 0)
+    assert_finite_tensor("predicted_noise", predicted_noise, 0, 0)
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"sanity loss is not finite: {loss.item()}")
+    print("Dataset loaded successfully")
+    print(f"Batch shape: history_speed={tuple(batch['history_speed'].shape)}")
+    print(f"Condition shape: {tuple(condition.shape)}")
+    print(f"Target shape: {tuple(clean_actions.shape)}")
+    print(f"Predicted noise shape: {tuple(predicted_noise.shape)}")
+    print(f"Loss: {loss.item():.6f}")
+    print(f"CUDA: {torch.cuda.is_available()} device={device}")
+    print("Sanity test PASSED")
+
+
 def main() -> None:
     args = parse_args()
-    if not args.dataroot.exists():
-        raise FileNotFoundError(f"Dataset root does not exist: {args.dataroot}")
+    train_dataroot = args.train_dataroot or args.dataroot
+    train_version = args.version or args.train_version
+    if train_dataroot is None:
+        raise ValueError("--train-dataroot is required")
+    if not train_dataroot.exists():
+        raise FileNotFoundError(f"Training dataset root does not exist: {train_dataroot}")
+    validate_nuscenes_dataroot(train_dataroot, train_version)
+    if args.test_dataroot is not None:
+        validate_nuscenes_dataroot(args.test_dataroot, args.test_version)
     if args.epochs <= 0 or args.batch_size <= 0 or args.gradient_accumulation_steps <= 0:
         raise ValueError("epochs, batch-size, and gradient-accumulation-steps must be positive")
 
     device = resolve_device(args.device)
     print_environment(device)
-    print(f"Dataset root: {args.dataroot}")
-    print(f"Dataset version: {args.version}")
+    print(f"Train dataset root: {train_dataroot}")
+    print(f"Train dataset version: {train_version}")
+    if args.test_dataroot is not None:
+        print(f"Test dataset root verified only, not used for training: {args.test_dataroot}")
+        print(f"Test dataset version: {args.test_version}")
     if args.sanity_test:
         print("Sanity test mode: using a small subset and limited optimizer steps")
     elif device.type == "cpu":
@@ -306,8 +389,10 @@ def main() -> None:
 
     checkpoints_dir, results_dir = make_output_dirs(args.output_dir)
     config_payload = {
-        "dataroot": str(args.dataroot),
-        "version": args.version,
+        "train_dataroot": str(train_dataroot),
+        "train_version": train_version,
+        "test_dataroot": str(args.test_dataroot) if args.test_dataroot else None,
+        "test_version": args.test_version,
         "output_dir": str(args.output_dir),
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -323,8 +408,8 @@ def main() -> None:
     save_json(args.output_dir / "config.json", config_payload)
 
     dataset_config = DatasetConfig(
-        dataroot=args.dataroot,
-        version=args.version,
+        dataroot=train_dataroot,
+        version=train_version,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
@@ -370,6 +455,18 @@ def main() -> None:
     print(f"DiffusionPolicy trainable parameters: {parameter_count(diffusion_policy)}")
     print(f"Total trainable parameters: {parameter_count(condition_encoder) + parameter_count(diffusion_policy)}")
 
+    if args.sanity_test:
+        run_sanity_test(
+            train_loader,
+            condition_encoder,
+            diffusion_policy,
+            scheduler,
+            optimizer,
+            scaler,
+            device,
+        )
+        return
+
     start_epoch = 1
     best_val_loss = math.inf
     history: list[dict[str, float]] = []
@@ -414,6 +511,8 @@ def main() -> None:
                 optimizer,
                 best_val_loss,
                 config_payload,
+                scheduler,
+                normalizer,
             )
             torch.save(payload, checkpoints_dir / "best.pt")
         payload = checkpoint_payload(
@@ -423,11 +522,15 @@ def main() -> None:
             optimizer,
             best_val_loss,
             config_payload,
+            scheduler,
+            normalizer,
         )
         torch.save(payload, checkpoints_dir / "latest.pt")
 
         save_json(results_dir / "training_history.json", history)
         save_loss_curve(history, results_dir / "loss_curve.png")
+        save_json(args.output_dir / "training_history.json", history)
+        save_loss_curve(history, args.output_dir / "loss_curve.png")
 
     summary = {
         "best_val_loss": best_val_loss,
@@ -439,6 +542,16 @@ def main() -> None:
         "best_checkpoint": str(checkpoints_dir / "best.pt"),
     }
     save_json(results_dir / "training_summary.json", summary)
+    try:
+        from export_checkpoint import export_checkpoint
+
+        export_checkpoint(
+            checkpoint_path=checkpoints_dir / "best.pt",
+            output_path=args.output_dir / "diffusion_policy_checkpoint.zip",
+            output_dir=args.output_dir,
+        )
+    except Exception as exc:
+        print(f"Automatic checkpoint export skipped: {type(exc).__name__}: {exc}")
     print(f"Training complete. Best checkpoint: {checkpoints_dir / 'best.pt'}")
 
 

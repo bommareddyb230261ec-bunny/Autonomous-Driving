@@ -1,22 +1,38 @@
-# Kaggle Diffusion Policy Training
+# Kaggle Diffusion Policy Training And Test Inference
 
-This workflow keeps local Windows work limited to code editing and Git. Training happens in a Kaggle GPU notebook, and outputs are written under `/kaggle/working/diffusion_outputs`.
+This workflow keeps local Windows work limited to code editing and Git. Training happens on Kaggle GPU using nuScenes `v1.0-trainval`. Final inference uses the official annotation-free nuScenes `v1.0-test` split and does not compute supervised loss.
+
+Expected nuScenes dataroot structure:
+
+```text
+/kaggle/input/<TRAINVAL_DATASET>/
+  samples/
+  sweeps/
+  maps/
+  v1.0-trainval/
+
+/kaggle/input/<TEST_DATASET>/
+  samples/
+  sweeps/
+  maps/
+  v1.0-test/
+```
+
+If Kaggle mounts either dataset differently, the scripts print the detected structure and fail clearly.
 
 ## Cell 1: Clone Repository
 
 ```bash
-git clone https://github.com/<USERNAME>/<REPOSITORY>.git
+git clone https://github.com/bommareddyb230261ec-bunny/Autonomous-Driving.git
 ```
 
 ## Cell 2: Enter Repository
 
 ```bash
-cd <REPOSITORY>
+cd Autonomous-Driving
 ```
 
 ## Cell 3: Install Missing Requirements Without Replacing PyTorch
-
-First check what is missing:
 
 ```bash
 python - <<'PY'
@@ -34,13 +50,13 @@ print(" ".join(missing))
 PY
 ```
 
-If the previous command prints package names, install only those missing dependencies:
+If package names are printed:
 
 ```bash
 pip install diffusers nuscenes-devkit matplotlib "numpy>=1.26,<3"
 ```
 
-Kaggle usually already has a CUDA-compatible PyTorch build. Do not replace it unless it is broken, and avoid `pip install -r requirements.txt` if it would replace Kaggle's working PyTorch/CUDA environment.
+Do not install a CPU PyTorch wheel on Kaggle. Keep Kaggle's CUDA PyTorch unless it is broken.
 
 ## Cell 4: Verify GPU
 
@@ -55,20 +71,20 @@ print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "n
 PY
 ```
 
-## Cell 5: Locate nuScenes Dataset
+## Cell 5: Locate Datasets
 
 ```bash
-find /kaggle/input -maxdepth 3 -type d | head -100
+find /kaggle/input -maxdepth 3 -type d | sort | head -200
 ```
 
-Choose the folder that contains the nuScenes files. The training command accepts this path through `--dataroot`.
+Choose one dataroot containing `v1.0-trainval` and one dataroot containing `v1.0-test`.
 
 ## Cell 6: Run Sanity Test
 
 ```bash
 python kaggle_train.py \
-  --dataroot /kaggle/input/<YOUR_NUSCENES_DATASET> \
-  --version v1.0-mini \
+  --train-dataroot /kaggle/input/<TRAINVAL_DATASET> \
+  --train-version v1.0-trainval \
   --output-dir /kaggle/working/diffusion_outputs \
   --sanity-test \
   --batch-size 4 \
@@ -76,14 +92,24 @@ python kaggle_train.py \
   --num-workers 2
 ```
 
-This runs a tiny optimization pass to verify dataset loading, normalization, conditioning, diffusion noise scheduling, forward pass, backward pass, and checkpoint writing.
+Expected terminal lines include:
+
+```text
+Dataset loaded successfully
+Condition shape: ...
+Target shape: ...
+Predicted noise shape: ...
+Loss: ...
+CUDA: ...
+Sanity test PASSED
+```
 
 ## Cell 7: Run Full Training
 
 ```bash
 python kaggle_train.py \
-  --dataroot /kaggle/input/<YOUR_NUSCENES_DATASET> \
-  --version v1.0-mini \
+  --train-dataroot /kaggle/input/<TRAINVAL_DATASET> \
+  --train-version v1.0-trainval \
   --output-dir /kaggle/working/diffusion_outputs \
   --epochs 10 \
   --batch-size 4 \
@@ -92,7 +118,9 @@ python kaggle_train.py \
   --num-workers 2
 ```
 
-## Cell 8: Inspect Checkpoints
+The script fits normalization only on the train split from `v1.0-trainval`, validates scene-disjoint train/validation splits, saves `latest.pt` every epoch, saves `best.pt` only when validation improves, and automatically exports a ZIP after training completes.
+
+## Cell 8: Inspect Training Outputs
 
 ```bash
 ls -lh /kaggle/working/diffusion_outputs
@@ -100,19 +128,25 @@ ls -lh /kaggle/working/diffusion_outputs/checkpoints
 ls -lh /kaggle/working/diffusion_outputs/results
 ```
 
-Expected checkpoint paths:
+Expected files:
 
 ```text
 /kaggle/working/diffusion_outputs/checkpoints/best.pt
 /kaggle/working/diffusion_outputs/checkpoints/latest.pt
+/kaggle/working/diffusion_outputs/normalization_stats.json
+/kaggle/working/diffusion_outputs/training_history.json
+/kaggle/working/diffusion_outputs/loss_curve.png
+/kaggle/working/diffusion_outputs/results/training_history.json
+/kaggle/working/diffusion_outputs/results/loss_curve.png
+/kaggle/working/diffusion_outputs/diffusion_policy_checkpoint.zip
 ```
 
 ## Cell 9: Resume Training
 
 ```bash
 python kaggle_train.py \
-  --dataroot /kaggle/input/<YOUR_NUSCENES_DATASET> \
-  --version v1.0-mini \
+  --train-dataroot /kaggle/input/<TRAINVAL_DATASET> \
+  --train-version v1.0-trainval \
   --output-dir /kaggle/working/diffusion_outputs \
   --epochs 20 \
   --batch-size 4 \
@@ -122,17 +156,32 @@ python kaggle_train.py \
   --resume /kaggle/working/diffusion_outputs/checkpoints/latest.pt
 ```
 
-## Cell 10: Export ZIP
+## Cell 10: Run Official Test Inference
+
+```bash
+python kaggle_test.py \
+  --test-dataroot /kaggle/input/<TEST_DATASET> \
+  --test-version v1.0-test \
+  --checkpoint /kaggle/working/diffusion_outputs/checkpoints/best.pt \
+  --output-dir /kaggle/working/diffusion_test_outputs
+```
+
+This does not train, does not use labels, and does not compute supervised loss. It saves speed/curvature predictions and an integrated trajectory estimate for each valid test sample.
+
+Expected test outputs:
+
+```text
+/kaggle/working/diffusion_test_outputs/test_predictions.json
+/kaggle/working/diffusion_test_outputs/predictions/test_predictions.json
+/kaggle/working/diffusion_test_outputs/test_summary.json
+```
+
+## Cell 11: Export Checkpoint ZIP Manually
 
 ```bash
 python export_checkpoint.py \
-  --output-dir /kaggle/working/diffusion_outputs
-```
-
-Expected ZIP:
-
-```text
-/kaggle/working/diffusion_outputs/diffusion_policy_checkpoint.zip
+  --checkpoint /kaggle/working/diffusion_outputs/checkpoints/best.pt \
+  --output /kaggle/working/diffusion_outputs/diffusion_policy_checkpoint.zip
 ```
 
 Files under `/kaggle/working/` can be downloaded from the Kaggle notebook Output/File interface.
